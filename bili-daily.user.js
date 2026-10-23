@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         桃夭 · B站每日白嫖 & 经验
 // @namespace    https://github.com/LHuiMeng/bili-daily-userscript
-// @version      1.3.0
+// @version      1.4.0
 // @description  进 B 站自动做每日经验任务（登录/观看/分享/投币）、领大会员每日经验与每月权益、漫画签到、银瓜子换硬币、大会员积分签到。油猴菜单里有设置面板：每项功能独立开关 + 上次执行时间。全部走浏览器登录态，不碰密码。
 // @author       LHuiMeng (毁梦)
 // @match        https://www.bilibili.com/*
@@ -74,7 +74,7 @@
     collapseAfter: 15000, // 跑完多久自动收成小条
   };
 
-  const VERSION = '1.3.0';
+  const VERSION = '1.4.0';
 
   /* ======================= 配置持久化 ======================= */
   const CONFIG_KEY = 'tyBiliConfig';
@@ -382,7 +382,9 @@
             `<label class="opt"><span class="nm">${name}</span>` +
             `<input type="number" data-k="${k}" min="${min}" max="${max}" value="${CONFIG[k]}"></label>`
         ).join('') +
-        '<div class="sect">上次执行</div><div class="lastbox">' +
+        '<div class="sect">今日经验</div><div class="lastbox todayexp">' +
+        fmtExpToday(expCache.data) +
+        '</div><div class="sect">上次执行</div><div class="lastbox">' +
         fmtLast() +
         '</div><div class="lastbox" style="padding-top:0;color:#6d7788">保存后立即生效；关掉的项下次运行不再执行。</div>';
 
@@ -403,6 +405,13 @@
       modalEl.querySelector('.cancel').onclick = close;
       modalEl.querySelector('.x').onclick = close;
       modalEl.classList.add('on');
+      // 异步补一次真实数据（设置面板要求同步渲染，所以先显示缓存）
+      getTodayExp(true)
+        .then((e) => {
+          const slot = modalEl.querySelector('.todayexp');
+          if (slot) slot.textContent = fmtExpToday(e);
+        })
+        .catch(() => {});
     }
 
     return { mount, set, tip, busy, collapseSoon, render, openSettings };
@@ -492,6 +501,56 @@
     return { ok: true };
   }
 
+  // 经验明细：最近一周每条带 delta/time/reason。这是判断「经验有没有真到账」的唯一可信来源，
+  // exp/reward 的 login/watch/share 布尔字段实测会一直是 false（登录奖励早就到账了它还报未完成）。
+  let expCache = { at: 0, data: null };
+
+  async function getTodayExp(force) {
+    if (!force && expCache.data && Date.now() - expCache.at < 5000) return expCache.data;
+    const r = await getJson('/x/member/web/exp/log');
+    if (r.code !== 0) return null;
+    const list = (r.data && r.data.list) || [];
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    const today = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+    const items = list.filter((x) => String((x && x.time) || '').startsWith(today));
+    const total = items.reduce((s, x) => s + (Number(x.delta) || 0), 0);
+    const has = (re) => items.some((x) => re.test(String((x && x.reason) || '')));
+    const data = {
+      total,
+      items,
+      hasWatch: has(/观看/),
+      hasShare: has(/分享/),
+      hasCoin: has(/投币/),
+      hasLogin: has(/登录/),
+    };
+    expCache = { at: Date.now(), data };
+    return data;
+  }
+
+  // 以经验明细为准；查不到明细时返回 null，调用方再回退到 exp/reward 的老字段
+  async function expHas(kind, force) {
+    const e = await getTodayExp(force);
+    if (!e) return null;
+    if (kind === 'watch') return e.hasWatch;
+    if (kind === 'share') return e.hasShare;
+    if (kind === 'coin') return e.hasCoin;
+    return e.hasLogin;
+  }
+
+  // 今日经验一行：总量 + 按原因聚合
+  function fmtExpToday(e) {
+    if (!e) return '查不到经验明细';
+    if (!e.items.length) return `今日 +0`;
+    const by = new Map();
+    for (const it of e.items) {
+      const k = String(it.reason || '其他').replace(/(奖励|经验)$/, '');
+      by.set(k, (by.get(k) || 0) + (Number(it.delta) || 0));
+    }
+    const detail = [...by.entries()].map(([k, v]) => `${k}${v}`).join(' · ');
+    return `今日 +${e.total}（${detail}）`;
+  }
+
   async function getDailyStatus() {
     const r = await getJson('/x/member/web/exp/reward');
     if (r.code !== 0) throw new Error(`${r.code} ${r.message}`);
@@ -531,7 +590,22 @@
 
   async function taskWatch(status, cache) {
     if (!CONFIG.watch) return UI.set('watch', '观看视频', 'skip', '配置已关闭');
-    if (status.watch) return UI.set('watch', '观看视频', 'skip', '今天已经看过');
+
+    // 判据优先用经验明细；查不到才退回 exp/reward 的字段（那个字段实测不可靠）
+    const watchDone = async () => {
+      const got = await expHas('watch', true);
+      if (got !== null) return got;
+      try {
+        return (await getDailyStatus()).watch === true;
+      } catch (e) {
+        return false;
+      }
+    };
+
+    const pre = await expHas('watch');
+    if (pre === true || (pre === null && status.watch)) {
+      return UI.set('watch', '观看视频', 'skip', '今天已经看过（经验里有记录）');
+    }
 
     const v = cache.video || (await pickVideo());
     cache.video = v;
@@ -559,8 +633,7 @@
     // 第 3 步：播放中，进度推到接近片尾
     await heartbeat(v, dur - 1, { playType: 0, realtime: dur, realPlayed: dur - 1 });
 
-    let after = await getDailyStatus();
-    if (after.watch) {
+    if (await watchDone()) {
       return UI.set('watch', '观看视频', 'ok', `+${EXP.watch} 经验 · 播放链路生效 · 《${clip(v.title, 16)}》`);
     }
 
@@ -576,20 +649,23 @@
     await heartbeat(v, -1, { playType: 4, realtime: dur, realPlayed: dur });
     await sleep(2500);
 
-    after = await getDailyStatus();
-    if (after.watch) return UI.set('watch', '观看视频', 'ok', `+${EXP.watch} 经验 · 观看记录生效`);
+    if (await watchDone()) return UI.set('watch', '观看视频', 'ok', `+${EXP.watch} 经验 · 观看记录生效`);
 
     // 第 5 层：真播放兜底。纯接口上报 B 站不认，只能让真播放器自己发心跳。
     if (CONFIG.realPlay) {
       const secs = Number(CONFIG.playSeconds) || 30;
       UI.set('watch', '观看视频', 'run', `接口层无效，真播 ${secs}s…`);
       const pr = await playRealVideo(v.bvid, secs);
-      await sleep(2500);
-      after = await getDailyStatus();
-      if (after.watch) {
+      await sleep(4000);
+      if (await watchDone()) {
         return UI.set('watch', '观看视频', 'ok', `+${EXP.watch} 经验 · 真播放 ${pr.played}s 生效`);
       }
-      return UI.set('watch', '观看视频', 'warn', `真播放 ${pr.played}s 仍未到账（${pr.detail || '未知'}）`);
+      return UI.set(
+        'watch',
+        '观看视频',
+        'warn',
+        `真播放 ${pr.played}s，经验明细里仍没有「观看」（${pr.detail || '未知'}）·B站判定的，非脚本能改`
+      );
     }
 
     UI.set('watch', '观看视频', 'warn', `点击上报 code ${click.code}，watch 仍是 false（真播放兜底已关）`);
@@ -598,7 +674,11 @@
   /* ======================= 任务：分享 ======================= */
   async function taskShare(status, cache) {
     if (!CONFIG.share) return UI.set('share', '分享视频', 'skip', '配置已关闭');
-    if (status.share) return UI.set('share', '分享视频', 'skip', '今天已经分享过');
+
+    const pre = await expHas('share');
+    if (pre === true || (pre === null && status.share)) {
+      return UI.set('share', '分享视频', 'skip', '今天已经分享过（经验里有记录）');
+    }
 
     const v = cache.video || (await pickVideo());
     cache.video = v;
@@ -615,15 +695,12 @@
     await gap();
 
     if (r.code === 0) {
-      // 接口回 0 不代表经验到账，复查一次任务状态
-      let ok = false;
-      try {
-        ok = (await getDailyStatus()).share === true;
-      } catch (e) {
-        /* 忽略 */
-      }
-      if (ok) UI.set('share', '分享视频', 'ok', `+${EXP.share} 经验`);
-      else UI.set('share', '分享视频', 'warn', '接口回 0，但分享状态没变（经验可能没给）');
+      // 接口回 0 不代表经验到账，只看经验明细
+      await sleep(2000);
+      const got = await expHas('share', true);
+      const ok = got === null ? (await getDailyStatus()).share === true : got;
+      if (ok) UI.set('share', '分享视频', 'ok', `+${EXP.share} 经验（明细已到账）`);
+      else UI.set('share', '分享视频', 'warn', '接口回 0，但经验明细里没有「分享」记录 → B站没给');
     } else if (r.code === -403) UI.set('share', '分享视频', 'warn', '被风控拒绝（-403），今天跳过，别硬刷');
     else UI.set('share', '分享视频', 'fail', `${r.code} ${r.message || ''}`);
   }
@@ -1117,15 +1194,21 @@
       let status = {};
       try {
         status = await getDailyStatus();
+      } catch (e) {
+        status = {};
+      }
+      try {
+        const e0 = await getTodayExp(true);
         const bits = [
-          status.login ? '登录✓' : '登录✗',
-          status.watch ? '观看✓' : '观看✗',
-          status.share ? '分享✓' : '分享✗',
+          e0 && e0.hasLogin ? '登录✓' : '登录✗',
+          e0 && e0.hasWatch ? '观看✓' : '观看✗',
+          e0 && e0.hasShare ? '分享✓' : '分享✗',
           `投币经验 ${status.coins != null ? status.coins : '?'}/50`,
         ];
-        UI.set('daily', '每日任务', 'ok', bits.join(' · '));
+        UI.set('daily', '今日进度（开跑前）', 'ok', bits.join(' · '));
+        UI.set('todayExp', '今日已得经验', e0 ? 'ok' : 'warn', fmtExpToday(e0));
       } catch (e) {
-        UI.set('daily', '每日任务', 'warn', '查不到任务状态：' + String(e.message || e));
+        UI.set('daily', '今日进度', 'warn', '查不到经验明细：' + String(e.message || e));
       }
 
       const steps = [
@@ -1162,24 +1245,32 @@
         /* 忽略 */
       }
       try {
-        const fin = await getDailyStatus();
-        const bits = [
-          fin.login ? '登录✓' : '登录✗',
-          fin.watch ? '观看✓' : '观看✗',
-          fin.share ? '分享✓' : '分享✗',
-          `投币经验 ${fin.coins != null ? fin.coins : '?'}/50`,
-        ];
-        UI.set('daily', '每日任务（收尾）', 'ok', bits.join(' · '));
+        const finExp = await getTodayExp(true);
+        if (finExp) {
+          UI.set('todayExp', '今日已得经验', 'ok', fmtExpToday(finExp));
+          const bits = [
+            finExp.hasLogin ? '登录✓' : '登录✗',
+            finExp.hasWatch ? '观看✓' : '观看✗',
+            finExp.hasShare ? '分享✓' : '分享✗',
+            finExp.hasCoin ? '投币✓' : '投币—',
+          ];
+          UI.set('daily', '今日进度（收尾）', 'ok', bits.join(' · '));
+        }
       } catch (e) {
         /* 忽略 */
       }
 
-      let gained = state.expAfter - state.expBefore;
-      if (state.level > state.levelBefore) gained = -1; // 升级了，差值不可信
+      let todayTotal = null;
+      try {
+        const fin = await getTodayExp(true);
+        todayTotal = fin ? fin.total : null;
+      } catch (e) {
+        /* 忽略 */
+      }
       const secs = Math.round((Date.now() - startedAt) / 1000);
       UI.tip(
-        gained > 0
-          ? `本次经验 +${gained} · 用时 ${secs}s · 硬币剩 ${state.money}`
+        todayTotal != null
+          ? `今日经验 +${todayTotal} · 用时 ${secs}s · 硬币剩 ${state.money}`
           : `跑完了 · 用时 ${secs}s · 硬币剩 ${state.money}`
       );
 
