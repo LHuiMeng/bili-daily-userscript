@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         桃夭 · B站每日白嫖 & 经验
 // @namespace    https://github.com/LHuiMeng/bili-daily-userscript
-// @version      1.2.1
-// @description  进 B 站自动做每日经验任务（登录/观看/分享/投币）、领大会员每日经验与每月权益、漫画签到、银瓜子换硬币、大会员积分签到。逐项可开关，全部走浏览器登录态，不碰密码。
+// @version      1.3.0
+// @description  进 B 站自动做每日经验任务（登录/观看/分享/投币）、领大会员每日经验与每月权益、漫画签到、银瓜子换硬币、大会员积分签到。油猴菜单里有设置面板：每项功能独立开关 + 上次执行时间。全部走浏览器登录态，不碰密码。
 // @author       LHuiMeng (毁梦)
 // @match        https://www.bilibili.com/*
 // @match        https://space.bilibili.com/*
@@ -62,6 +62,10 @@
     silver2coin: true,    // 银瓜子换硬币
     liveSign: true,       // 直播签到（官方已下线，留着只为某天复活）
 
+    // 观看兜底
+    realPlay: true,       // 接口层无效时，真开小窗播 30 秒（真播放器自己发心跳）
+    playSeconds: 30,      // 真播放补多少秒
+
     // 行为
     autoRun: true,        // 进页面自动跑
     autoRunDelay: 2500,   // 自动跑前的等待（毫秒）
@@ -70,7 +74,61 @@
     collapseAfter: 15000, // 跑完多久自动收成小条
   };
 
-  const VERSION = '1.2.1';
+  const VERSION = '1.3.0';
+
+  /* ======================= 配置持久化 ======================= */
+  const CONFIG_KEY = 'tyBiliConfig';
+  const RUN_AT_KEY = 'tyBiliLastRunAt';
+
+  // 设置面板里能开/关的项（顺序即显示顺序）
+  const TOGGLES = [
+    ['watch', '观看视频', '+5 经验'],
+    ['share', '分享视频', '+5 经验'],
+    ['coin', '投币', '每枚 +10，日上限 50'],
+    ['realPlay', '真播放补观看', '接口层无效时开小窗播 30s'],
+    ['vipExp', '大会员每日经验', '+10 经验'],
+    ['vipPrivilege', '大会员每月权益', 'B 币券等'],
+    ['bigPoint', '大会员积分签到', '借道 big.bilibili.com'],
+    ['manga', '漫画签到', '每天一次'],
+    ['silver2coin', '银瓜子换硬币', '需 700 银瓜子'],
+    ['liveSign', '直播签到', '官方已下线'],
+    ['autoRun', '进页面自动运行', '关掉后只能手动点「重跑」'],
+  ];
+
+  // 设置面板里能改的数值项
+  const NUMBERS = [
+    ['coinPerRun', '每次最多投币', 0, 5],
+    ['keepCoins', '硬币保留线', 0, 9999],
+    ['playSeconds', '真播放秒数', 10, 120],
+  ];
+
+  function loadConfig() {
+    try {
+      const raw = GM_getValue(CONFIG_KEY, '');
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      if (!saved || typeof saved !== 'object') return;
+      for (const k of Object.keys(saved)) {
+        if (k in CONFIG) CONFIG[k] = saved[k];
+      }
+    } catch (e) {
+      /* 配置坏了就用默认值 */
+    }
+  }
+
+  function saveConfig(patch) {
+    let merged = {};
+    try {
+      merged = JSON.parse(GM_getValue(CONFIG_KEY, '{}') || '{}') || {};
+    } catch (e) {
+      merged = {};
+    }
+    Object.assign(merged, patch);
+    GM_setValue(CONFIG_KEY, JSON.stringify(merged));
+    Object.assign(CONFIG, patch);
+  }
+
+  loadConfig();
 
   const API = 'https://api.bilibili.com';
   const LIVE = 'https://api.live.bilibili.com';
@@ -99,7 +157,7 @@
 
   /* ======================= 面板 ======================= */
   const UI = (() => {
-    let host, root, bodyEl, headEl, tipEl, btnEl;
+    let host, root, bodyEl, headEl, tipEl, btnEl, modalEl;
     const rows = new Map();
 
     function mount() {
@@ -110,6 +168,7 @@
         headEl = root.querySelector('.head');
         tipEl = root.querySelector('.tip');
         btnEl = root.querySelector('.rerun');
+        modalEl = root.querySelector('.modal');
         return;
       }
       host = document.createElement('div');
@@ -138,6 +197,54 @@
           .chev { color: #8b96a8; font-size: 11px; transition: transform .18s ease; }
           .wrap.min .chev { transform: rotate(-90deg); }
           .wrap.min .body, .wrap.min .foot { display: none; }
+          .modal {
+            display: none; position: fixed; inset: 0; z-index: 2147483647;
+            background: rgba(0,0,0,.45); align-items: center; justify-content: center;
+            font: 12px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+          }
+          .modal.on { display: flex; }
+          .card {
+            width: 330px; max-height: 78vh; display: flex; flex-direction: column;
+            background: #161922; color: #e9eef5; border: 1px solid rgba(255,255,255,.10);
+            border-radius: 14px; box-shadow: 0 18px 48px rgba(0,0,0,.6); overflow: hidden;
+          }
+          .cardhead {
+            display: flex; align-items: center; padding: 10px 12px; font-weight: 600;
+            border-bottom: 1px solid rgba(255,255,255,.07);
+          }
+          .cardhead .x {
+            margin-left: auto; padding: 0 6px; font-size: 15px; line-height: 1;
+            background: none; border: 0; color: #8b96a8;
+          }
+          .cardbody { padding: 8px 4px; overflow: auto; }
+          .cardbody::-webkit-scrollbar { width: 6px; }
+          .cardbody::-webkit-scrollbar-thumb { background: rgba(255,255,255,.14); border-radius: 3px; }
+          .sect {
+            padding: 8px 10px 4px; color: #6d7788; font-size: 11px; letter-spacing: .4px;
+            text-transform: uppercase;
+          }
+          .opt {
+            display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+            cursor: pointer; border-radius: 8px;
+          }
+          .opt:hover { background: rgba(255,255,255,.05); }
+          .opt input[type=checkbox] { accent-color: #ff7a9c; width: 14px; height: 14px; }
+          .opt .nm { flex: 1; min-width: 0; }
+          .opt em { color: #6d7788; font-style: normal; font-size: 10.5px; }
+          .opt input[type=number] {
+            width: 62px; padding: 3px 6px; text-align: right; font: inherit; font-size: 11.5px;
+            color: #e9eef5; background: rgba(255,255,255,.07);
+            border: 1px solid rgba(255,255,255,.12); border-radius: 6px;
+          }
+          .lastbox { padding: 4px 10px 10px; color: #8b96a8; font-size: 11px; line-height: 1.7; }
+          .lastbox b { color: #dfe6f0; font-weight: 500; }
+          .cardfoot {
+            display: flex; gap: 8px; justify-content: flex-end; padding: 9px 12px;
+            border-top: 1px solid rgba(255,255,255,.07);
+          }
+          .cardfoot .save {
+            color: #14161c; background: #ff7a9c; border-color: transparent; font-weight: 600;
+          }
           .body { overflow: auto; padding: 6px 4px 4px; }
           .body::-webkit-scrollbar { width: 6px; }
           .body::-webkit-scrollbar-thumb { background: rgba(255,255,255,.14); border-radius: 3px; }
@@ -176,6 +283,16 @@
             <span class="tip">准备中…</span>
             <button class="rerun">重跑</button>
           </div>
+        </div>
+        <div class="modal">
+          <div class="card">
+            <div class="cardhead"><span>设置</span><button class="x" title="关闭">×</button></div>
+            <div class="cardbody"></div>
+            <div class="cardfoot">
+              <button class="cancel">取消</button>
+              <button class="save">保存</button>
+            </div>
+          </div>
         </div>`;
       document.documentElement.appendChild(host);
 
@@ -183,6 +300,7 @@
       headEl = root.querySelector('.head');
       tipEl = root.querySelector('.tip');
       btnEl = root.querySelector('.rerun');
+      modalEl = root.querySelector('.modal');
       headEl.addEventListener('click', () => root.querySelector('.wrap').classList.toggle('min'));
       btnEl.addEventListener('click', () => {
         if (window.__tyBiliRun) window.__tyBiliRun(true);
@@ -232,7 +350,62 @@
       }, CONFIG.collapseAfter);
     }
 
-    return { mount, set, tip, busy, collapseSoon, render };
+    function fmtLast() {
+      const iso = GM_getValue(RUN_AT_KEY, '');
+      const lastDay = GM_getValue('tyBiliLastRun', '');
+      if (!iso) return '还没有执行记录';
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return '还没有执行记录';
+      const pad = (n) => String(n).padStart(2, '0');
+      const when = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      const mins = Math.round((Date.now() - d.getTime()) / 60000);
+      const ago =
+        mins < 1 ? '刚刚' : mins < 60 ? `${mins} 分钟前` : mins < 1440 ? `${Math.round(mins / 60)} 小时前` : `${Math.round(mins / 1440)} 天前`;
+      const todayState = lastDay === todayKey() ? '今天已跑过' : '今天还没跑';
+      return `上次：<b>${when}</b>（${ago}）<br>状态：${todayState}`;
+    }
+
+    function openSettings() {
+      mount();
+      if (!modalEl) return;
+      const body = modalEl.querySelector('.cardbody');
+      body.innerHTML =
+        '<div class="sect">功能开关</div>' +
+        TOGGLES.map(
+          ([k, name, hint]) =>
+            `<label class="opt"><input type="checkbox" data-k="${k}"${CONFIG[k] ? ' checked' : ''}>` +
+            `<span class="nm">${name}</span><em>${hint}</em></label>`
+        ).join('') +
+        '<div class="sect">参数</div>' +
+        NUMBERS.map(
+          ([k, name, min, max]) =>
+            `<label class="opt"><span class="nm">${name}</span>` +
+            `<input type="number" data-k="${k}" min="${min}" max="${max}" value="${CONFIG[k]}"></label>`
+        ).join('') +
+        '<div class="sect">上次执行</div><div class="lastbox">' +
+        fmtLast() +
+        '</div><div class="lastbox" style="padding-top:0;color:#6d7788">保存后立即生效；关掉的项下次运行不再执行。</div>';
+
+      modalEl.querySelector('.save').onclick = () => {
+        const patch = {};
+        modalEl.querySelectorAll('input[type=checkbox][data-k]').forEach((el) => {
+          patch[el.dataset.k] = el.checked;
+        });
+        modalEl.querySelectorAll('input[type=number][data-k]').forEach((el) => {
+          const n = Number(el.value);
+          if (Number.isFinite(n)) patch[el.dataset.k] = n;
+        });
+        saveConfig(patch);
+        modalEl.classList.remove('on');
+        tip('设置已保存，立即生效');
+      };
+      const close = () => modalEl.classList.remove('on');
+      modalEl.querySelector('.cancel').onclick = close;
+      modalEl.querySelector('.x').onclick = close;
+      modalEl.classList.add('on');
+    }
+
+    return { mount, set, tip, busy, collapseSoon, render, openSettings };
   })();
 
   /* ======================= 网络层 ======================= */
@@ -405,12 +578,21 @@
 
     after = await getDailyStatus();
     if (after.watch) return UI.set('watch', '观看视频', 'ok', `+${EXP.watch} 经验 · 观看记录生效`);
-    UI.set(
-      'watch',
-      '观看视频',
-      'warn',
-      `点击上报 code ${click.code}，watch 仍是 false（B站可能又改了判定）`
-    );
+
+    // 第 5 层：真播放兜底。纯接口上报 B 站不认，只能让真播放器自己发心跳。
+    if (CONFIG.realPlay) {
+      const secs = Number(CONFIG.playSeconds) || 30;
+      UI.set('watch', '观看视频', 'run', `接口层无效，真播 ${secs}s…`);
+      const pr = await playRealVideo(v.bvid, secs);
+      await sleep(2500);
+      after = await getDailyStatus();
+      if (after.watch) {
+        return UI.set('watch', '观看视频', 'ok', `+${EXP.watch} 经验 · 真播放 ${pr.played}s 生效`);
+      }
+      return UI.set('watch', '观看视频', 'warn', `真播放 ${pr.played}s 仍未到账（${pr.detail || '未知'}）`);
+    }
+
+    UI.set('watch', '观看视频', 'warn', `点击上报 code ${click.code}，watch 仍是 false（真播放兜底已关）`);
   }
 
   /* ======================= 任务：分享 ======================= */
@@ -632,9 +814,125 @@
 
   function parseRemoteCall() {
     const qs = new URLSearchParams(location.search);
+    const nonce = qs.get(REMOTE_NONCE) || (location.hash.match(/tybili_nonce=([a-z0-9]+)/) || [])[1] || '';
+    if (qs.get('tybili_play')) return { task: 'play', nonce };
     const task = qs.get(REMOTE_PARAM) || (location.hash.match(/tybili_task=([a-zA-Z]+)/) || [])[1];
     if (!task) return null;
-    return { task, nonce: qs.get(REMOTE_NONCE) || (location.hash.match(/tybili_nonce=([a-z0-9]+)/) || [])[1] || '' };
+    return { task, nonce };
+  }
+
+  function waitForEl(sel, timeout) {
+    return new Promise((resolve) => {
+      const t0 = Date.now();
+      const tick = () => {
+        const el = document.querySelector(sel);
+        if (el) return resolve(el);
+        if (Date.now() - t0 > timeout) return resolve(null);
+        setTimeout(tick, 300);
+      };
+      tick();
+    });
+  }
+
+  // 小窗里被叫来真播一段：只有真播放器发的上报，B站才可能认观看任务
+  async function runPlayTask(call) {
+    const out = { source: 'tyBili', task: 'play', nonce: call.nonce, ok: false, played: 0, detail: '' };
+    const send = (extra) => {
+      try {
+        const target = window.parent && window.parent !== window ? window.parent : window;
+        target.postMessage(Object.assign({}, out, extra), '*');
+      } catch (e) {
+        /* 忽略 */
+      }
+    };
+    try {
+      const v = await waitForEl('video', 12000);
+      if (!v) throw new Error('页面里没找到 video 元素');
+      v.muted = true;
+      // play() 的 Promise 在流没加载/自动播放被拦时可能永不 resolve，必须带超时，否则整条流程吊死
+      const tryPlay = () => Promise.race([v.play().catch(() => {}), sleep(3000)]);
+      await tryPlay();
+      if (v.paused) {
+        // 兜底：点一下播放器（选择器仅尽力而为，点不到也不影响后面的结果上报）
+        const btn = document.querySelector('.bpx-player-ctrl-play, .bpx-player-video-area, #bilibili-player');
+        if (btn) btn.click();
+        await tryPlay();
+      }
+
+      const target = Number(CONFIG.playSeconds) || 30;
+      const t0 = Date.now();
+      let lastMove = t0;
+      while (Date.now() - t0 < (target + 20) * 1000) {
+        await sleep(1000);
+        const now = Math.round(v.currentTime || 0);
+        if (now > out.played) {
+          out.played = now;
+          lastMove = Date.now();
+        }
+        send({ type: 'progress' });
+        if (out.played >= target) break;
+        // 播放器 10 秒不动就别干等，直接认输
+        if (Date.now() - lastMove > 10000) {
+          out.detail = '播放器 10 秒没动（自动播放可能被拦）';
+          break;
+        }
+      }
+      out.ok = out.played >= target;
+      if (!out.detail) out.detail = out.ok ? '真播放完成' : `只播到 ${out.played}s`;
+    } catch (e) {
+      out.detail = String((e && e.message) || e);
+    }
+    out.type = 'done';
+    send({ type: 'done' });
+  }
+
+  // 父页面：右下角悬浮小窗，让真播放器跑一段
+  function playRealVideo(bvid, seconds) {
+    return new Promise((resolve) => {
+      const nonce = Math.random().toString(36).slice(2, 10);
+      const wrap = document.createElement('div');
+      wrap.style.cssText =
+        'position:fixed;right:16px;bottom:96px;z-index:2147483646;width:360px;border-radius:12px;overflow:hidden;' +
+        'box-shadow:0 10px 30px rgba(0,0,0,.55);background:#0f1116;' +
+        'font:12px/1.4 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:#e9eef5';
+      const bar = document.createElement('div');
+      bar.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 10px;background:#1b1f28';
+      bar.innerHTML =
+        '<span style="color:#ff7a9c">✦</span><span>补观看任务</span>' +
+        `<span class="cnt" style="margin-left:auto;color:#8b96a8">0/${seconds}s</span>`;
+      const frame = document.createElement('iframe');
+      frame.allow = 'autoplay';
+      frame.style.cssText = 'width:360px;height:203px;border:0;display:block;background:#000';
+      frame.src = `https://www.bilibili.com/video/${bvid}/?tybili_play=1&${REMOTE_NONCE}=${nonce}`;
+      wrap.append(bar, frame);
+      document.documentElement.appendChild(wrap);
+
+      let done = false;
+      const finish = (r) => {
+        if (done) return;
+        done = true;
+        window.removeEventListener('message', onMsg);
+        clearTimeout(timer);
+        try {
+          wrap.remove();
+        } catch (e) {
+          /* 忽略 */
+        }
+        resolve(r);
+      };
+      const onMsg = (ev) => {
+        const d = ev.data;
+        if (!d || d.source !== 'tyBili' || d.task !== 'play' || d.nonce !== nonce) return;
+        if (d.type === 'progress') {
+          const cnt = bar.querySelector('.cnt');
+          if (cnt) cnt.textContent = `${Number(d.played) || 0}/${seconds}s`;
+          return;
+        }
+        finish({ ok: !!d.ok, played: Number(d.played) || 0, detail: String(d.detail || '') });
+      };
+      const timer = setTimeout(() => finish({ ok: false, played: 0, detail: '小窗超时' }), (seconds + 30) * 1000);
+      window.addEventListener('message', onMsg);
+    });
   }
 
   // iframe 里的脚本走这条：只做被指派的那一件事，不挂面板、不抢锁
@@ -886,6 +1184,7 @@
       );
 
       GM_setValue('tyBiliLastRun', todayKey());
+      GM_setValue(RUN_AT_KEY, new Date().toISOString());
     } finally {
       running = false;
       releaseLock();
@@ -902,7 +1201,8 @@
     // 1) 被父页面借道调用：只做那一件事，不挂面板、不抢锁
     const remote = parseRemoteCall();
     if (remote) {
-      runRemoteTask(remote);
+      if (remote.task === 'play') runPlayTask(remote);
+      else runRemoteTask(remote);
       return;
     }
     // 2) 其它 iframe 一律不跑（避免同一套任务在页面内多个 frame 里重复执行）
@@ -914,6 +1214,7 @@
     const isToday = last === today;
 
     if (typeof GM_registerMenuCommand === 'function') {
+      GM_registerMenuCommand('⚙ 设置（功能开关 / 上次执行）', () => UI.openSettings());
       GM_registerMenuCommand('立即重跑 B站每日', () => run(true));
       GM_registerMenuCommand('清除「今天已跑」标记', () => {
         GM_setValue('tyBiliLastRun', '');
