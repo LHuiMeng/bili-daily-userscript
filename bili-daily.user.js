@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         桃夭 · B站每日白嫖 & 经验
 // @namespace    https://github.com/LHuiMeng/bili-daily-userscript
-// @version      1.4.0
+// @version      1.4.1
 // @description  进 B 站自动做每日经验任务（登录/观看/分享/投币）、领大会员每日经验与每月权益、漫画签到、银瓜子换硬币、大会员积分签到。油猴菜单里有设置面板：每项功能独立开关 + 上次执行时间。全部走浏览器登录态，不碰密码。
 // @author       LHuiMeng (毁梦)
 // @match        https://www.bilibili.com/*
@@ -74,7 +74,7 @@
     collapseAfter: 15000, // 跑完多久自动收成小条
   };
 
-  const VERSION = '1.4.0';
+  const VERSION = '1.4.1';
 
   /* ======================= 配置持久化 ======================= */
   const CONFIG_KEY = 'tyBiliConfig';
@@ -258,6 +258,7 @@
           .st-skip .ic { color: #77808f; }
           .st-warn .ic { color: #f0b23e; }
           .st-fail .ic { color: #ff6b81; }
+          .st-pend .ic { color: #a08bff; }
           .foot {
             display: flex; align-items: center; gap: 8px; padding: 8px 10px;
             border-top: 1px solid rgba(255,255,255,.07);
@@ -307,7 +308,7 @@
       });
     }
 
-    const ICON = { run: '◌', ok: '✓', skip: '–', warn: '!', fail: '✕' };
+    const ICON = { run: '◌', ok: '✓', skip: '–', warn: '!', fail: '✕', pend: '◔' };
 
     function set(key, label, status, detail) {
       rows.set(key, { label, status, detail });
@@ -414,7 +415,7 @@
         .catch(() => {});
     }
 
-    return { mount, set, tip, busy, collapseSoon, render, openSettings };
+    return { mount, set, tip, busy, collapseSoon, render, openSettings, get: (k) => rows.get(k) };
   })();
 
   /* ======================= 网络层 ======================= */
@@ -663,12 +664,12 @@
       return UI.set(
         'watch',
         '观看视频',
-        'warn',
-        `真播放 ${pr.played}s，经验明细里仍没有「观看」（${pr.detail || '未知'}）·B站判定的，非脚本能改`
+        'pend',
+        `已真播 ${pr.played}s，但经验明细还没刷出「观看」——明细有延迟，稍后回来看这行会自己变`
       );
     }
 
-    UI.set('watch', '观看视频', 'warn', `点击上报 code ${click.code}，watch 仍是 false（真播放兜底已关）`);
+    UI.set('watch', '观看视频', 'pend', `上报都成功了（点击 code ${click.code}），经验明细未刷新；真播放兜底已关`);
   }
 
   /* ======================= 任务：分享 ======================= */
@@ -700,7 +701,7 @@
       const got = await expHas('share', true);
       const ok = got === null ? (await getDailyStatus()).share === true : got;
       if (ok) UI.set('share', '分享视频', 'ok', `+${EXP.share} 经验（明细已到账）`);
-      else UI.set('share', '分享视频', 'warn', '接口回 0，但经验明细里没有「分享」记录 → B站没给');
+      else UI.set('share', '分享视频', 'pend', '接口回 0，经验明细还没刷出「分享」——有延迟，稍后核验');
     } else if (r.code === -403) UI.set('share', '分享视频', 'warn', '被风控拒绝（-403），今天跳过，别硬刷');
     else UI.set('share', '分享视频', 'fail', `${r.code} ${r.message || ''}`);
   }
@@ -1244,33 +1245,37 @@
       } catch (e) {
         /* 忽略 */
       }
+      // 收尾只查一次经验明细，面板各行和 tip 都用这一份数据，避免互相打架
+      let finExp = null;
       try {
-        const finExp = await getTodayExp(true);
-        if (finExp) {
-          UI.set('todayExp', '今日已得经验', 'ok', fmtExpToday(finExp));
-          const bits = [
-            finExp.hasLogin ? '登录✓' : '登录✗',
-            finExp.hasWatch ? '观看✓' : '观看✗',
-            finExp.hasShare ? '分享✓' : '分享✗',
-            finExp.hasCoin ? '投币✓' : '投币—',
-          ];
-          UI.set('daily', '今日进度（收尾）', 'ok', bits.join(' · '));
-        }
+        finExp = await getTodayExp(true);
       } catch (e) {
-        /* 忽略 */
+        finExp = null;
+      }
+      if (finExp) {
+        UI.set('todayExp', '今日已得经验', 'ok', fmtExpToday(finExp));
+        const bits = [
+          finExp.hasLogin ? '登录✓' : '登录✗',
+          finExp.hasWatch ? '观看✓' : '观看✗',
+          finExp.hasShare ? '分享✓' : '分享✗',
+          finExp.hasCoin ? '投币✓' : '投币—',
+        ];
+        UI.set('daily', '今日进度（收尾）', 'ok', bits.join(' · '));
+        // 跑的时候明细还没刷出来、标了「待核验」的，收尾再对一次账
+        const wRow = UI.get('watch');
+        if (wRow && wRow.status === 'pend' && finExp.hasWatch) {
+          UI.set('watch', '观看视频', 'ok', `+${EXP.watch} 经验（收尾核验：明细已到账）`);
+        }
+        const sRow = UI.get('share');
+        if (sRow && sRow.status === 'pend' && finExp.hasShare) {
+          UI.set('share', '分享视频', 'ok', `+${EXP.share} 经验（收尾核验：明细已到账）`);
+        }
       }
 
-      let todayTotal = null;
-      try {
-        const fin = await getTodayExp(true);
-        todayTotal = fin ? fin.total : null;
-      } catch (e) {
-        /* 忽略 */
-      }
       const secs = Math.round((Date.now() - startedAt) / 1000);
       UI.tip(
-        todayTotal != null
-          ? `今日经验 +${todayTotal} · 用时 ${secs}s · 硬币剩 ${state.money}`
+        finExp
+          ? `今日经验 +${finExp.total} · 用时 ${secs}s · 硬币剩 ${state.money}`
           : `跑完了 · 用时 ${secs}s · 硬币剩 ${state.money}`
       );
 
@@ -1306,6 +1311,7 @@
 
     if (typeof GM_registerMenuCommand === 'function') {
       GM_registerMenuCommand('⚙ 设置（功能开关 / 上次执行）', () => UI.openSettings());
+      GM_registerMenuCommand('打开经验记录页（核对到账）', () => window.open('https://account.bilibili.com/account/record', '_blank'));
       GM_registerMenuCommand('立即重跑 B站每日', () => run(true));
       GM_registerMenuCommand('清除「今天已跑」标记', () => {
         GM_setValue('tyBiliLastRun', '');
