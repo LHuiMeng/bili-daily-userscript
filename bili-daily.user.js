@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         桃夭 · B站每日白嫖 & 经验
 // @namespace    https://github.com/LHuiMeng/bili-daily-userscript
-// @version      1.4.1
+// @version      1.5.0
 // @description  进 B 站自动做每日经验任务（登录/观看/分享/投币）、领大会员每日经验与每月权益、漫画签到、银瓜子换硬币、大会员积分签到。油猴菜单里有设置面板：每项功能独立开关 + 上次执行时间。全部走浏览器登录态，不碰密码。
 // @author       LHuiMeng (毁梦)
 // @match        https://www.bilibili.com/*
@@ -74,11 +74,12 @@
     collapseAfter: 15000, // 跑完多久自动收成小条
   };
 
-  const VERSION = '1.4.1';
+  const VERSION = '1.5.0';
 
   /* ======================= 配置持久化 ======================= */
   const CONFIG_KEY = 'tyBiliConfig';
   const RUN_AT_KEY = 'tyBiliLastRunAt';
+  const HIDE_KEY = 'tyBiliHiddenOn'; // 用户手动关掉悬浮窗的日期：当天不再显示、也不自动跑
 
   // 设置面板里能开/关的项（顺序即显示顺序）
   const TOGGLES = [
@@ -271,12 +272,18 @@
           }
           button:hover { background: rgba(255,255,255,.13); }
           button:disabled { opacity: .45; cursor: default; }
+          .close {
+            background: none; border: 0; color: #6d7788; font-size: 15px;
+            line-height: 1; padding: 0 3px; margin-left: 2px; cursor: pointer;
+          }
+          .close:hover { color: #ff7a9c; background: none; }
         </style>
         <div class="wrap">
           <div class="head">
             <span class="spark">✦</span>
             <span class="title">桃夭 · B站每日 <span class="ver">v${VERSION}</span></span>
             <span class="count"></span>
+            <button class="close" title="今天不再显示（明天自动恢复）">×</button>
             <span class="chev">▾</span>
           </div>
           <div class="body"><div class="rows"></div></div>
@@ -303,6 +310,13 @@
       btnEl = root.querySelector('.rerun');
       modalEl = root.querySelector('.modal');
       headEl.addEventListener('click', () => root.querySelector('.wrap').classList.toggle('min'));
+      const closeBtn = root.querySelector('.close');
+      if (closeBtn) {
+        closeBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          hideForToday();
+        });
+      }
       btnEl.addEventListener('click', () => {
         if (window.__tyBiliRun) window.__tyBiliRun(true);
       });
@@ -417,6 +431,13 @@
 
     return { mount, set, tip, busy, collapseSoon, render, openSettings, get: (k) => rows.get(k) };
   })();
+
+  // 用户手动关掉悬浮窗：今天就别再露面（也不自动跑），第二天自动恢复
+  function hideForToday() {
+    GM_setValue(HIDE_KEY, todayKey());
+    const host = document.getElementById('ty-bili-daily-host');
+    if (host) host.remove();
+  }
 
   /* ======================= 网络层 ======================= */
   let lastErr = '';
@@ -1304,6 +1325,9 @@
     // 2) 其它 iframe 一律不跑（避免同一套任务在页面内多个 frame 里重复执行）
     if (window.top !== window) return;
 
+    // 3) 今天被手动关掉了就什么都不做：不挂面板、不自动跑
+    if (GM_getValue(HIDE_KEY, '') === todayKey()) return;
+
     UI.mount();
     const last = GM_getValue('tyBiliLastRun', '');
     const today = todayKey();
@@ -1311,6 +1335,11 @@
 
     if (typeof GM_registerMenuCommand === 'function') {
       GM_registerMenuCommand('⚙ 设置（功能开关 / 上次执行）', () => UI.openSettings());
+      GM_registerMenuCommand('重新显示悬浮窗（今天）', () => {
+        GM_setValue(HIDE_KEY, '');
+        UI.mount();
+        UI.tip('已恢复显示；今天要跑就点「重跑」');
+      });
       GM_registerMenuCommand('打开经验记录页（核对到账）', () => window.open('https://account.bilibili.com/account/record', '_blank'));
       GM_registerMenuCommand('立即重跑 B站每日', () => run(true));
       GM_registerMenuCommand('清除「今天已跑」标记', () => {
